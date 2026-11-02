@@ -1,0 +1,31 @@
+  # ---------------------------------------------------------------------------
+  # LOCAL-COMPUTE BUG HUNT (--compute local). Local-only; do not commit.
+  # Paste these entries under the `selectors:` key of your project's
+  # selectors.yml (create the file with a top-level `selectors:` if you have
+  # none). They are the only edit the kit makes to your project.
+  #
+  # Every local_blockers entry gets a comment block directly above it:
+  #   WHY:    the symptom (error code + message) and the cause, if known
+  #   LINK:   the ledger entry (LC-00n) and/or upstream issue, or "none yet"
+  #   REMOVE: the condition under which the entry can be deleted
+  # A trailing `+` also drops the model's descendants (they would only be
+  # skipped anyway). No `+` = a cut point: see docs/frontiers-and-selectors.md.
+  # ---------------------------------------------------------------------------
+  - name: local_blockers
+    description: Known local-compute failures and their descendants. Shrinks as Fusion improves.
+    definition:
+      union:
+        # WHY:    example: warehouse-only ML function, can never run on DuckDB.
+        # LINK:   none (out of scope for local compute)
+        # REMOVE: never
+        - 'tag:lc_kit_never_matches_anything'
+
+  - name: local_dag
+    description: The probe. Everything you want to run locally, minus the blockers.
+    definition:
+      union:
+        - 'fqn:*'          # or e.g. 'models/staging+' to start smaller
+        - exclude:
+            - method: selector
+              value: local_blockers
+            - 'resource_type:seed'   # seeds load from CSV locally; drop this line to test them too
