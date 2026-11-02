@@ -99,3 +99,7 @@ Labs contact.
    data in the ledger.
 5. Nothing is filed on dbt Labs' repositories. Optionally,
    `lc_ledger.py open-issue` files an entry on a findings repo **you** name.
+
+## License
+
+[Apache-2.0](LICENSE)
