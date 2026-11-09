@@ -17,9 +17,12 @@ from and which engine types hold them.
 1. `source()` / `ref()` render to `database.schema.identifier` with the
    **target you run with**. A `schema: "{{ target.schema }}"` source, or a
    custom `generate_schema_name`, renders differently per target.
-2. `dbt pull` reads that relation from the warehouse and writes it to
-   `target/data/<database>/<schema>/<identifier>/output.parquet`
-   ([pull.md](pull.md#where-the-data-lands)).
+2. `dbt pull` reads that relation from the warehouse and stores it under the
+   target path (`target/db/...` on current builds, see
+   [pull.md](pull.md#where-the-data-lands)). It reads the relation your
+   *target* names, even with `--defer`: a dev schema missing the model, or
+   holding a stale copy, is a setup problem
+   ([pull.md](pull.md#pull-reads-your-target-not-production)).
 3. `dbt run --compute local` renders the names again and looks for those
    files.
 
@@ -47,7 +50,19 @@ Things that do differ locally and are worth knowing:
   the *local* catalog when running locally. A model whose columns are
   generated from such a query can compile with fewer columns locally
   (`No column ... found`). One entry covers every model hit this way, so
-  check the ledger before adding it.
+  check the ledger before adding it. Data-reading macros
+  (`get_column_values`, `run_query` pivots) see the *sampled* table, so a
+  short column list may only mean the sample lacked a value
+  ([pull.md](pull.md#sampling)).
+* **Relation discovery** (`dbt_utils.get_relations_by_pattern` and similar)
+  answers from a cache that pull fills. On builds from November 2026 it was
+  filled by `pull --select` but not by `pull --selector`, and capped at 500
+  relations. A cache miss names the pull command to run.
+* **Hard-coded relation names.** A model that reads `my_db.my_schema.t`
+  directly, with no `ref()` or `source()`, has no edge in the DAG, so pull
+  never fetches `t` and the model fails locally. That is a product boundary,
+  not a dialect bug: list such models separately
+  ([reading-results.md](reading-results.md#the-buckets)).
 
 ## Types
 
@@ -59,15 +74,18 @@ Pulled data is converted to DuckDB types. Observed on Snowflake:
 | `NUMBER(38,0)` | `BIGINT` | values beyond ±9.2e18 do not fit |
 | `NUMBER(p,s)`, s > 0 | `DECIMAL(p,s)` | arithmetic result scale can differ |
 | `FLOAT` | `DOUBLE` | last-digit differences after aggregation |
-| `TIMESTAMP_NTZ` | `TIMESTAMP` | |
-| `TIMESTAMP_TZ` / `_LTZ` | `TIMESTAMP WITH TIME ZONE` | session time zone affects display and `::date` |
-| `VARIANT`, `OBJECT`, `ARRAY` | `JSON` or nested types | path access, `parse_json` strictness, `::type` casts |
+| `FLOAT` in a table that also has `VARIANT` columns | can come back as 32-bit `FLOAT` on some builds | more than last-digit drift; check the local `describe` |
+| `TIMESTAMP_NTZ` | `TIMESTAMP` | digits beyond microseconds are dropped; some builds mis-read years before 1677 or after 2262 |
+| `TIMESTAMP_TZ` | `TIMESTAMP WITH TIME ZONE` | the per-value offset is not kept: values come back as UTC instants |
+| `TIMESTAMP_LTZ` | `TIMESTAMP WITH TIME ZONE` | rendered in the *local* session time zone, see [reading-results.md](reading-results.md#time-zones) |
+| `VARIANT`, `OBJECT`, `ARRAY` | `JSON` or nested types | path access, `parse_json` strictness, `::type` casts; if pull cannot describe them they fall back to `VARCHAR` with a warning; JSON text with `\xHH` escapes fails locally (`Malformed JSON ... invalid escaped character`) |
 | `BOOLEAN`, `DATE`, `TIME` | same | |
 
 To see the local schema of a pulled relation:
 
 ```bash
-uv run --with duckdb python -c "import duckdb; print(duckdb.sql(\"describe select * from 'target/data/<db>/<schema>/<table>/output.parquet'\"))"
+P=target/db/sessions/last/pull/<db>/<schema>/<table>/output.parquet   # target/data/... on older builds
+uv run --with duckdb python -c "import duckdb; print(duckdb.sql(\"describe select * from '$P'\"))"
 ```
 
 and the warehouse's exact schema:

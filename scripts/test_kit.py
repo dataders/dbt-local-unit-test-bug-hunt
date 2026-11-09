@@ -147,7 +147,7 @@ def test_payload_has_remote_and_local_copies():
     cache = {"schemas": {"source.p.s.t": [["ID", "varchar"]]}, "samples": {"source.p.s.t": [{"ID": "a"}]}}
     payload, _ = fx.test_payload(case, cache, {}, anonymize_pii=False)
     tests = payload["unit_tests"]
-    assert [t["name"] for t in tests] == ["lc_kit__m__f2__remote", "lc_kit__m__f2__local"]
+    assert [t["name"] for t in tests] == ["lc_kit__m__f3__remote", "lc_kit__m__f3__local"]
     assert [t["config"]["compute"] for t in tests] == ["remote", "local"]
     assert tests[0]["given"] == tests[1]["given"]
     assert all(t["overrides"]["macros"]["is_incremental"] is False for t in tests)
@@ -157,3 +157,38 @@ def test_static_analysis_off_is_set_aside():
     case = fx.Case("model.p.m", "m", None, "table", "m.sql", [], [])
     node = {"raw_code": "select 1 as x", "config": {"static_analysis": "off"}}
     assert "static_analysis" in fx.set_aside_reason(node, case, {}, False)
+
+
+def test_anonymize_spares_non_person_name_columns():
+    for column in ("EVENT_NAME", "PLAN_NAME", "FIRST_SEEN_AT", "LAST_UPDATED_AT", "STATUS"):
+        assert fx.anonymize(column, "x") == "x", column
+    for column in ("NAME", "FIRST_NAME", "CUSTOMER_NAME", "USERNAME", "BILLING_CITY", "IP_ADDRESS"):
+        assert fx.anonymize(column, "x") != "x", column
+
+
+def test_values_equal_to_sql_literals_are_kept():
+    node = {"raw_code": "select * from {{ ref('a') }} where contact_name in ('Ada', 'O''Brien')"}
+    literals = fx.sql_literals(node["raw_code"])
+    assert {"Ada", "O'Brien", "a"} <= set(literals)
+    rows, _ = fx.project_rows([{"CONTACT_NAME": "Ada"}, {"CONTACT_NAME": "Bob"}],
+                              [["CONTACT_NAME", "varchar"]], anonymize_pii=True, keep=frozenset(literals))
+    assert rows[0]["CONTACT_NAME"] == "Ada" and rows[1]["CONTACT_NAME"].startswith("anon_")
+
+
+def test_nondeterminism_in_compiled_code_is_set_aside():
+    case = fx.Case("model.p.m", "m", None, "table", "m.sql", [], [])
+    node = {"raw_code": "select {{ days_since('d') }} as n", "compiled_code": "select datediff(day, d, current_date()) as n"}
+    assert "nondeterministic" in fx.set_aside_reason(node, case, {}, False)
+
+
+def test_expect_drops_unrepresentable_and_requested_columns():
+    case = fx.Case("model.p.fct_x", "fct_x", None, "table", "m.sql", [], [])
+    rows = [{"ID": 1, "NOTE": "", "DAYS_SINCE": 3}, {"ID": 2, "NOTE": "ok", "DAYS_SINCE": 4}]
+    drop = fx.expect_columns_to_drop(case, rows, ["fct_x.days_since", "other.ID"])
+    assert set(drop) == {"NOTE", "DAYS_SINCE"}
+    assert fx.expect_columns_to_drop(case, [{"ID": 1}], []) == {}
+
+
+def test_backslashes_survive_snowflake_string_escapes():
+    assert fx.sql_string('{"a": "say \\"hi\\""}') == "'{\"a\": \"say \\\\\"hi\\\\\"\"}'"
+    assert fx.literal('{"p": "C:\\\\x"}', "VARIANT").count("\\\\\\\\") == 1

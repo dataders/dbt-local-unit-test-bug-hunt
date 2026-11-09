@@ -19,6 +19,9 @@ repos.
   auth is best; browser SSO works for small projects.
 * [`uv`](https://docs.astral.sh/uv/) for the kit's scripts (they declare
   their own dependencies).
+* Room on the machine. A small project needs little, but a large one
+  (1,000+ models) can use tens of GB of local state at `--sample 10000`, and
+  tens of GB of RAM while it runs. Run one dbt process at a time.
 * A scratch branch or `git worktree` of your project. The kit adds two
   selectors and a folder of generated tests, and none of it should be
   committed.
@@ -43,6 +46,8 @@ Local compute is **experimental**. It has two parts, and the kit uses both.
   product contract.
 
 Error messages may say `sidecar`. That means the same thing as `local`.
+`--compute` may not appear in `dbt --help` on your build; it is accepted
+anyway.
 
 ## Quickstart
 
@@ -53,14 +58,15 @@ From your project directory (`KIT=path/to/kit`):
 export DBT_ENGINE_EXPERIMENTAL_LOCAL_UNIT_TESTS=true   # documented opt-in for local unit tests
 cat $KIT/templates/selectors.lc-kit.yml       # paste under `selectors:` in selectors.yml
 cp  $KIT/templates/BUG_LEDGER.md BUG_LEDGER.md
-dbt parse && dbt ls --selector local_dag --resource-type model | wc -l
+dbt compile && dbt ls --selector local_dag --resource-type model | wc -l
+dbt show --compute remote --inline "show parameters like 'TIMEZONE' in session"   # note it, and `date +%Z`
 
 # 1. pull a sample of the probe's inputs (experimental, undocumented: always --sample, --preview first)
 dbt pull --selector local_dag --exclude resource_type:test --sample 1000 --preview
 dbt pull --selector local_dag --exclude resource_type:test --sample 1000
 
 # 2. run the probe locally (experimental, undocumented) and group the failures
-dbt run --selector local_dag --compute local
+dbt run --selector local_dag --compute local      # repeat until the pass count stops growing
 cp target/run_results.json lc-local-1.json
 uv run $KIT/scripts/lc_compare.py --local lc-local-1.json --ledger BUG_LEDGER.md
 
@@ -87,6 +93,7 @@ Labs contact.
 | generate and read paired unit tests | [docs/paired-unit-tests.md](docs/paired-unit-tests.md) |
 | write, de-duplicate, and hand over the ledger | [docs/bug-ledger.md](docs/bug-ledger.md) |
 | see a finished example | [examples/jaffle-dryrun/](examples/jaffle-dryrun/) |
+| see what changed in the kit | [CHANGELOG.md](CHANGELOG.md) |
 
 ## Ground rules
 

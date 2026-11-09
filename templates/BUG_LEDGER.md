@@ -26,7 +26,8 @@ Do not paste real customer data: minimal repros use made-up literals.
   select ...
   ```
   `dbt show --select lc_repro --compute remote` vs `--compute local`
+- **Kind:** <dialect (one SQL statement shows it) | framework (needs a dbt project)>
 - **Suspected layer:** <pull | compile | translation | execution | macros | unknown>. Hypothesis: <why>
 - **Claim boundary:** <what this does not show>
 - **Affects:** <model names>
-- **Environment:** <dbt version>, <adapter>, <date>
+- **Environment:** <dbt version>, <adapter>, <date>; session TZ <zone>, host TZ <zone>; threads <n>; sample <spec>; pass <n>
