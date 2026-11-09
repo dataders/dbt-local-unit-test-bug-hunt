@@ -61,7 +61,7 @@ import yaml
 TAG = "lc_kit_paired"
 # Bump when the generated test semantics change: dbt caches parsed unit tests
 # by name, so a new contract must get a new name.
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 OPT_IN_ENV = "DBT_ENGINE_EXPERIMENTAL_LOCAL_UNIT_TESTS"
 
 # Introspection macros that would otherwise consult the warehouse at compile
@@ -86,10 +86,24 @@ NONDETERMINISTIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A column is treated as personal data when one of its `_`-separated parts is
+# in PII_PARTS, or when it is a person's name: `name` itself, or `*_name` with
+# a person-like part (`first_name`, `customer_name`). Plain `first`/`last`/
+# `name` parts are NOT enough: hashing `event_name`, `plan_name` or
+# `first_seen_at` breaks the model's filters on them and empties the expect.
 PII_PARTS = {
-    "address", "email", "first", "last", "name", "phone", "ip", "street",
-    "city", "zip", "postal", "ssn", "dob", "birth", "token", "secret", "password",
+    "address", "email", "phone", "ip", "street", "city", "zip", "postal", "ssn",
+    "dob", "birth", "token", "secret", "password", "firstname", "lastname",
+    "fullname", "surname", "username",
 }
+PERSON_PARTS = {
+    "first", "last", "full", "middle", "given", "family", "display", "user",
+    "contact", "customer", "person", "owner", "employee", "author", "manager", "rep",
+}
+# Single-quoted literals in a model's SQL. A sampled value equal to one of them
+# is kept as is: it is already in the code, and hashing it would make
+# `where status = 'active'` (or `in`, `like`, ...) match nothing.
+SQL_LITERAL_RE = re.compile(r"'((?:[^']|'')*)'")
 
 # The kit supports Snowflake only. The SQL below (row serialization, literals,
 # type names) is Snowflake dialect; other adapters are refused in main().
@@ -134,6 +148,8 @@ class Case:
     inputs: list[Input]
     macros: list[str]
     set_aside: str | None = None
+    # String literals in the model's SQL, kept un-anonymized in its fixtures.
+    literals: tuple[str, ...] = ()
 
     @property
     def test_name(self) -> str:
@@ -187,10 +203,16 @@ def load_cases(manifest_path: Path, keep_nondeterministic: bool = False) -> tupl
             path=node.get("original_file_path", ""),
             inputs=sorted(inputs, key=lambda i: i.unique_id),
             macros=sorted(node.get("depends_on", {}).get("macros", [])),
+            literals=sql_literals(node.get("raw_code", "") + "\n" + (node.get("compiled_code") or "")),
         )
         case.set_aside = set_aside_reason(node, case, nodes, keep_nondeterministic)
         cases.append(case)
     return sorted(cases, key=lambda c: c.unique_id), adapter
+
+
+def sql_literals(sql: str) -> tuple[str, ...]:
+    found = {m.group(1).replace("''", "'") for m in SQL_LITERAL_RE.finditer(sql)}
+    return tuple(sorted(v for v in found if v and len(v) <= 200))
 
 
 def set_aside_reason(node: dict, case: Case, nodes: dict, keep_nondeterministic: bool) -> str | None:
@@ -213,7 +235,9 @@ def set_aside_reason(node: dict, case: Case, nodes: dict, keep_nondeterministic:
     if ephemeral:
         return "ephemeral input has no relation to read a schema from: " + ", ".join(ephemeral)
     if not keep_nondeterministic:
-        match = NONDETERMINISTIC_RE.search(node.get("raw_code", ""))
+        # compiled_code (present after `dbt compile`) also catches clock or
+        # random calls hidden in macros, which raw_code does not show.
+        match = NONDETERMINISTIC_RE.search(node.get("raw_code", "") + "\n" + (node.get("compiled_code") or ""))
         if match:
             return f"nondeterministic SQL ({match.group(0).strip(' (').lower()})"
     return None
@@ -312,7 +336,9 @@ def get(row: dict[str, Any], name: str) -> Any:
 
 
 def sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+    # Snowflake string literals process backslash escapes ('\\"' is '"'), so JSON
+    # text with escaped quotes would no longer parse. Double each backslash.
+    return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 def chunks(items: list, size: int):
@@ -458,11 +484,18 @@ def save_cache(args: argparse.Namespace, cache: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def anonymize(column: str, value: Any) -> Any:
-    if not isinstance(value, str):
+def is_pii_column(column: str) -> bool:
+    lowered = column.lower()
+    parts = set(lowered.split("_")) | {lowered}
+    if parts & PII_PARTS:
+        return True
+    return lowered == "name" or (lowered.endswith("_name") and bool(parts & PERSON_PARTS))
+
+
+def anonymize(column: str, value: Any, keep: frozenset[str] | set[str] = frozenset()) -> Any:
+    if not isinstance(value, str) or value in keep:
         return value
-    parts = set(column.lower().split("_")) | {column.lower()}
-    if not parts & PII_PARTS:
+    if not is_pii_column(column):
         return value
     digest = hashlib.sha256(value.encode()).hexdigest()[:10]
     if "@" in value:
@@ -502,7 +535,8 @@ def unjson_plain(value: Any) -> Any:
 
 
 def project_rows(
-    rows: list[dict[str, Any]], schema: list[list[str]], anonymize_pii: bool
+    rows: list[dict[str, Any]], schema: list[list[str]], anonymize_pii: bool,
+    keep: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Project sampled rows onto the relation's real columns.
 
@@ -526,7 +560,7 @@ def project_rows(
             if name in unsupported and value is not None:
                 nulled.add(name)
                 value = None
-            out[name] = anonymize(name, value) if anonymize_pii else value
+            out[name] = anonymize(name, value, keep) if anonymize_pii else value
         projected.append(out)
     return projected, {"dropped_row_keys": sorted(dropped), "nulled_unsupported": sorted(nulled)}
 
@@ -561,7 +595,9 @@ def test_payload(case: Case, cache: dict, extra_overrides: dict, anonymize_pii: 
     given, notes = [], {}
     for item in case.inputs:
         schema = cache["schemas"][item.unique_id]
-        rows, note = project_rows([r for r in cache["samples"].get(item.unique_id, [])], schema, anonymize_pii)
+        rows, note = project_rows(
+            [r for r in cache["samples"].get(item.unique_id, [])], schema, anonymize_pii, frozenset(case.literals)
+        )
         if note["dropped_row_keys"] or note["nulled_unsupported"]:
             notes[item.unique_id] = note
         given.append({"input": item.expression, "format": "sql", "rows": rows_sql(rows, schema)})
@@ -735,6 +771,29 @@ def expect_value(value: Any) -> Any:
     return value
 
 
+def unrepresentable(value: Any) -> bool:
+    """Values a dict-format expect row cannot carry: '' and the string 'null'
+    both come back as SQL NULL, so the warehouse copy would fail its own test."""
+    return isinstance(value, str) and value.strip().lower() in {"", "null"}
+
+
+def expect_columns_to_drop(case: Case, rows: list[dict[str, Any]], requested: list[str]) -> dict[str, str]:
+    """Columns to leave out of `expect` (dbt compares only the listed columns)."""
+    drop: dict[str, str] = {}
+    for spec in requested:
+        model, _, column = spec.rpartition(".")
+        if model.lower() == case.name.lower():
+            for row in rows:
+                for key in row:
+                    if key.lower() == column.lower():
+                        drop[key] = "--drop-expect-column"
+    for row in rows:
+        for key, value in row.items():
+            if key not in drop and unrepresentable(unjson(value)):
+                drop[key] = "value '' or 'null' cannot be expressed in expect"
+    return drop
+
+
 def command_harvest(args: argparse.Namespace) -> int:
     cases = [c for c in selected_cases(args) if not c.set_aside and (args.tests_dir / c.filename).is_file()]
     print(f"harvest: {len(cases)} generated test(s)")
@@ -790,10 +849,19 @@ def command_harvest(args: argparse.Namespace) -> int:
         print(f"[expect {n}/{-(-len(pending) // args.expect_batch_size)}] {len(batch)} test(s)", flush=True)
         bisect(batch, f"expect-{n:04d}", fetch, failed)
 
+    dropped_columns: dict[str, dict[str, str]] = {}
+    for u, rows in list(results.items()):
+        drop = expect_columns_to_drop(by_id[u], rows, args.drop_expect_column)
+        if drop and rows and all(set(r) <= set(drop) for r in rows):
+            set_aside[u] = "every expect column was dropped: " + ", ".join(sorted(drop))
+            del results[u]
+        elif drop:
+            dropped_columns[u] = drop
     for u, rows in results.items():
         path = args.tests_dir / by_id[u].filename
         payload = read_yaml(path)
-        expect = {"rows": [{k: expect_value(v) for k, v in r.items()} for r in rows]}
+        drop = dropped_columns.get(u, {})
+        expect = {"rows": [{k: expect_value(v) for k, v in r.items() if k not in drop} for r in rows]}
         for test in payload["unit_tests"]:
             test["expect"] = expect
         write_yaml(path, payload)
@@ -807,10 +875,11 @@ def command_harvest(args: argparse.Namespace) -> int:
     report = write_report(args, "harvest-report.json", {
         "harvested": len(results),
         "empty_expect": sorted(u for u, r in results.items() if not r),
+        "expect_columns_dropped": dropped_columns,
         "set_aside": set_aside,
     })
-    print(f"harvested {len(results)} expectation(s) ({sum(1 for r in results.values() if not r)} empty); "
-          f"set aside {len(set_aside)}; report: {report}")
+    print(f"harvested {len(results)} expectation(s) ({sum(1 for r in results.values() if not r)} empty, "
+          f"{len(dropped_columns)} with dropped columns); set aside {len(set_aside)}; report: {report}")
     return 0
 
 
@@ -954,6 +1023,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-anonymize", action="store_true", help="keep PII-looking string values as sampled")
     p.add_argument("--keep-nondeterministic", action="store_true",
                    help="do not set aside models whose SQL calls now()/random()/...")
+    p.add_argument("--drop-expect-column", action="append", default=[], metavar="MODEL.COLUMN",
+                   help="leave a column out of expect, e.g. a clock-derived 'fct_x.DAYS_SINCE'; repeatable")
     p.add_argument("--refresh", action="store_true", help="rewrite existing generated tests (drops their expect)")
     return p
 

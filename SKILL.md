@@ -67,7 +67,14 @@ before a step you have not done before in this session.
 7. **Budget disk and time.** Always pull with `--sample` (default 1000).
    Check free disk before a large pull (`df -h .`). Long commands print
    `[n/total]` progress. Tell the user before anything you expect to take
-   more than 10 minutes.
+   more than 10 minutes. Large projects can need tens of GB of RAM and
+   disk for local state: check `free -g` as well.
+8. **One dbt process at a time** on the machine, and never two on one
+   `--target-path`. Concurrent processes contend for the Snowflake driver's
+   credential cache and fail each other's pulls.
+9. **Rule out the host before blaming the engine.** A burst of failures
+   across unrelated models (`stdout closed`, runner gone) is one crash. Rerun
+   once on a quiet host with fewer `--threads` before recording anything.
 
 ## The loop
 
@@ -84,14 +91,19 @@ before a step you have not done before in this session.
 * Confirm warehouse auth works read-only: `dbt show --compute remote
   --inline "select 1 as ok"`. Recommend key-pair / service-account auth
   over browser SSO for anything long ([docs/pull.md](docs/pull.md#auth-and-warehouse-load)).
+  With SSO, repeat the check right before every long pull.
+* Record the Snowflake session time zone (`show parameters like
+  'TIMEZONE' in session`) and the host's (`date +%Z`). Whole-hour timestamp
+  shifts later are almost always this ([docs/reading-results.md](docs/reading-results.md#time-zones)).
 * Add the probe and ledger selectors from `templates/selectors.lc-kit.yml`
   ([docs/frontiers-and-selectors.md](docs/frontiers-and-selectors.md)). Seed
   `local_blockers` only with genuinely out-of-scope models (warehouse-only
   functions). Start the probe small for big projects (`models/staging+`).
 * Copy `templates/BUG_LEDGER.md` to the user's chosen location (default: the
   project root, uncommitted) and fill the header.
-* `dbt parse`, then `dbt ls --selector local_dag --resource-type model | wc -l`
-  gives the denominator.
+* `dbt compile` (or at least `dbt parse`), then `dbt ls --selector local_dag
+  --resource-type model | wc -l` gives the denominator. Compiled SQL lets the
+  fixture generator see clock calls and literals inside macros.
 
 ### 1. Pull (experimental, undocumented)
 
@@ -100,9 +112,14 @@ dbt pull --selector local_dag --exclude resource_type:test --sample 1000 --previ
 dbt pull --selector local_dag --exclude resource_type:test --sample 1000
 ```
 
-Pull and run must use the same target, vars, and `--target-path`. A pull
-failure on one relation is itself a candidate (layer `pull`): record it,
-block or cut the affected model, and continue.
+Pull and run must use the same target, vars, and `--target-path`. Pull
+reads the relations your **target** names, even with `--defer`: an upstream
+model missing from, or stale in, the dev schema is setup, not a bug. Build
+it on the warehouse or cut it ([docs/pull.md](docs/pull.md#pull-reads-your-target-not-production)).
+If the summary says `0 downloaded ... N failed` with an auth error, re-auth
+and re-pull: that is one setup failure. Any other pull failure on one
+relation is itself a candidate (layer `pull`): record it, block or cut the
+affected model, and continue.
 
 ### 2. Run (experimental, undocumented)
 
@@ -114,6 +131,9 @@ uv run $KIT/scripts/lc_compare.py --local lc-local-<n>.json --ledger BUG_LEDGER.
 
 Prefer `dbt run` (models) for the probe. Local data tests on sampled data
 are sampling-sensitive ([docs/reading-results.md](docs/reading-results.md)).
+Run the probe again until the success count stops growing: models that
+introspect other relations only compile once those are built. Say which
+pass the headline counts.
 For each **new** candidate family, confirm the warehouse side read-only:
 `dbt show --compute remote --select <example model> --limit 5`.
 
@@ -124,22 +144,32 @@ uv run $KIT/scripts/lc_fixtures.py inventory
 uv run $KIT/scripts/lc_fixtures.py all --select '<glob>'     # scaffold + harvest + verify
 ```
 
+Never add a global `--compute local` (or `DBT_COMPUTE`) to these runs: it
+drops the `compute: remote` copies from the schedule.
+
 Start with a slice (one folder) and widen. Read
 `target/lc-kit/paired-report.md`: each `mismatch` shows a diff whose cells
-read `warehouse -> local`. Rule out ties, float last digits, and time-zone
-or "now" effects before calling it a bug
+read `warehouse -> local`. Rule out ties, float last digits (run local
+twice), whole-hour time-zone shifts, and "now" effects before calling it a
+bug. Expect many `match_empty` cases (about a third on real projects): they
+prove little, so report them separately
 ([docs/paired-unit-tests.md](docs/paired-unit-tests.md)).
 
 ### 4. Classify
 
 Put every failure in one bucket (from [docs/reading-results.md](docs/reading-results.md)):
-local-compute error, value mismatch, setup, sampling, warehouse/project, or
-out of scope. Only the first two become ledger entries. Out-of-scope models
-become blockers with `LINK: none`.
+local-compute error, value mismatch, setup, sampling, warehouse/project,
+out of scope, product boundary, or host. Only the first two become ledger
+entries (product boundary gets one entry for the whole family). Out-of-scope
+models become blockers with `LINK: none`. Then decide the kind: **dialect**
+if one SQL statement shows it, **framework** if it needs a dbt project
+([docs/bug-ledger.md](docs/bug-ledger.md#dialect-or-framework)).
 
 ### 5. Minimize
 
-For each new family, take one example and reduce it to the smallest SQL
+For each new family, first confirm it with the **real command** (same
+selector, exclusions, target, sample): narrowing the selection changes what
+is pulled versus built. Then take one example and reduce it to the smallest SQL
 that still differs: drop columns, then replace inputs with literals. Run it
 as a throwaway **model** with `dbt show --select lc_repro --compute remote`
 and `--compute local`, not `--inline`, which may skip local translation.
@@ -153,7 +183,8 @@ Delete the throwaway model afterwards.
   symptom, minimal repro, warehouse vs local result, suspected layer
   (marked as a hypothesis), claim boundary, affects, environment.
 * Same root cause as an existing entry: extend its **Affects**; no new
-  entry.
+  entry. Check the known families in
+  [docs/bug-ledger.md](docs/bug-ledger.md#families-seen-so-far) too.
 * Add or update the blocker in `selectors.yml` with
   `WHY` / `LINK: LC-00n` / `REMOVE`, and use a cut point where the children
   should still run.

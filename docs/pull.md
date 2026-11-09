@@ -14,9 +14,12 @@ from the warehouse (the fixture generator in
 [paired-unit-tests.md](paired-unit-tests.md) is the other, and it is
 optional).
 
-Facts below were observed on `dbt 2.1.0.dev20261019`. Pull is moving fast, so
+Facts below were first observed on `dbt 2.1.0.dev20261019` and updated from a
+larger campaign on two production-sized Snowflake projects (roughly 1,100-1,700
+models each) on Fusion builds from early November 2026. Pull is moving fast, so
 **preview before you pull** (`--preview`, below) and trust what it prints over
-this page.
+this page. Where a behavior below was being fixed at the time of writing, it
+says so: re-check it on your build before you record it.
 
 ## What gets pulled: the frontier
 
@@ -54,6 +57,26 @@ dry run `--indirect-selection cautious` did **not** stop this for pull, even
 though it does for `dbt ls`. Add `--exclude resource_type:test` to pull only
 what the models need.
 
+## Pull reads your target, not production
+
+Pull reads each frontier relation from the database and schema **the target
+you pass** would build it in. `--defer` and `--state` have no effect on pull.
+On a dev target, that means:
+
+* an upstream model that was **never built in your dev schema** fails to pull
+  (`Object ... does not exist or not authorized`), and every child then fails
+  locally with `Local relation ... is unavailable. Its previous dbt pull
+  failed: ...`. Build it on the warehouse first (`dbt run --select
+  <upstream>`, without `--compute`) or make it a cut point;
+* a dev relation built **before a column was added** pulls fine but is stale:
+  its children fail with `No column X found` (`dbt0227`). In the campaign, 7
+  of 10 such failures were stale dev tables, and they failed the same way on
+  the warehouse. That is setup, not a bug. Check the relation's
+  `last_altered` before recording it, and rebuild it.
+
+Package models from other projects can resolve to production names. Look at
+the `--preview` output to see which relation each input actually comes from.
+
 ## Sampling
 
 ```bash
@@ -77,6 +100,15 @@ dbt pull --selector local_dag --sample '{"start": "2024-07-01", "end": "2024-07-
   `--preview` before relying on a window.
 * Pulled data replaces the previous pull for the same relation. Change the
   sample size, re-pull.
+* **Macros that read data see the sample.** `dbt_utils.get_column_values`,
+  `run_query`-driven pivots and similar macros run against the *sampled*
+  local table. Their column lists come out short or empty, and the model then
+  fails or builds with fewer columns. `distinct` without `order by` can also
+  reorder generated columns. Pull the lookup tables those macros read whole,
+  or with a much larger sample, before you call it a bug.
+* Caveats on this page about `max_rows` with time windows,
+  `--indirect-selection`, and `--selector` on pull were being fixed in
+  November 2026. Check them on your build with `--preview`.
 
 **Choosing a sample size.** 1000 rows is a good default: big enough to hit
 most `CASE` branches, small enough to pull a large project in minutes. Raise
@@ -85,25 +117,41 @@ filters to a rare value and comes out empty. Lower it for very wide tables.
 
 ## Where the data lands
 
-Each pulled relation becomes one Parquet file under the **target path**:
+Pulled data lives under the **target path**. The layout depends on the build:
 
 ```text
+# builds from November 2026
+target/db/state/<database>.db                                   # DuckDB tables the local run reads
+target/db/sessions/last/pull/<database>/<schema>/<table>/output.parquet   # staging, kept
+target/db/sessions/last/pull/failures/relations.json            # which relations failed to pull, and why
+# the October 2026 build used in the dry run
 target/data/<database>/<schema>/<table>/output.parquet
 ```
 
-The local engine reads those files, so **`pull` and the local `run` must use
+The Parquet staging is kept after the load, so plan for about **twice** the
+downloaded size on disk.
+
+The local engine reads that state, so **`pull` and the local `run` must use
 the same `--target-path`** (and the same `--target` / profile, see
 [source-schemas.md](source-schemas.md)). A run with a different target path
 fails with `Table '...' does not exist in schema ...`. Every relation fails
 with the same message, which is how you recognize it.
 
-Inspect a pulled relation with DuckDB:
+Inspect a pulled relation's staged Parquet with DuckDB (use the
+`target/data/...` path on older builds):
 
 ```bash
-uv run --with duckdb python -c "import duckdb; print(duckdb.sql(\"select * from 'target/data/<db>/<schema>/<table>/output.parquet' limit 5\"))"
+P=target/db/sessions/last/pull/<db>/<schema>/<table>/output.parquet
+uv run --with duckdb python -c "import duckdb; print(duckdb.sql(\"select * from '$P' limit 5\"))"
 ```
 
 `dbt clean` deletes `target/`, and with it every pulled file.
+
+**Size, for planning.** A pull of about 1,100 relations at `--sample 10000`
+downloaded 6.7 M rows (6.4 GB) in about 35 minutes and left 13 GB of local
+state. At `--sample 1000` expect roughly a tenth of that. Check `df -h .`
+first. An unscoped pull **without** `--sample` copies whole tables and can
+fill the disk.
 
 ## Auth and warehouse load
 
@@ -115,6 +163,26 @@ uv run --with duckdb python -c "import duckdb; print(duckdb.sql(\"select * from 
 * **Browser SSO** (`authenticator: externalbrowser`) works, but tokens can
   expire in the middle of a long pull and the pull has to be restarted. For
   anything beyond a small project, use Snowflake key-pair auth.
+* **An expired token looks like a total failure.** The pull summary reads
+  `0 downloaded ... N failed` with `authentication timed out`, and every
+  model then fails locally with `Pull could not start because no warehouse
+  connection was available`. That is one setup problem, not N bugs. Run
+  `dbt show --compute remote --inline "select 1"` right before a long pull:
+  it proves access now, not that the token will last.
+* **Run one dbt process at a time per machine.** Two concurrent dbt
+  processes contend for the Snowflake driver's credential cache (`timed out
+  trying to acquire lease ... credential_cache.lease`) and the second one's
+  downloads all fail. Also never share one `--target-path` between two
+  processes.
+* **`--preview` is not free** on a large selection: it still resolves every
+  relation, and took more than 15 minutes on one big project.
+* **Expensive views can hang a pull.** `LIMIT` cannot short-circuit a view
+  that, say, ranks all of history, and pull has no per-relation timeout.
+  Killing dbt does not cancel the warehouse query: cancel it in Snowflake
+  (`select system$cancel_query('<id>')`) as well. Cut or block such views.
+* A bare `dbt pull` (no selection) also tries sources that nothing selected
+  uses, for example from disabled packages, and those can fail. Always pull
+  with the same selection you run.
 * Read access is enough. The role must be able to `SELECT` every source in
   the frontier. A source you cannot read fails the pull for that relation.
   Keep the models that read it in `local_blockers`.
@@ -125,5 +193,5 @@ uv run --with duckdb python -c "import duckdb; print(duckdb.sql(\"select * from 
 dbt parse
 dbt pull --selector local_dag --exclude resource_type:test --sample 1000 --preview   # look first
 dbt pull --selector local_dag --exclude resource_type:test --sample 1000
-du -sh target/data
+du -sh target/db target/data 2>/dev/null   # whichever your build uses
 ```
