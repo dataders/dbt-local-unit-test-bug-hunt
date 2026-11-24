@@ -2,8 +2,9 @@
 
 A model that builds locally can still compute different values. A **paired
 unit test** runs one model on the warehouse and locally over the *same fixed
-input*. If both sides pass the same expectation, the values match for that
-input. `scripts/lc_fixtures.py` generates these tests for your models.
+input*. If both sides pass the same nonempty warehouse expectation, the
+compared values match for that input. `scripts/lc_fixtures.py` generates
+these tests for your models.
 
 This is the documented part of local compute: dbt's experimental **local
 unit tests** ([`compute` config](https://docs.getdbt.com/reference/resource-configs/compute), [run unit tests
@@ -123,22 +124,29 @@ uv run $K/scripts/lc_fixtures.py all --select 'models/marts/*'
 * Re-running `scaffold` keeps existing tests and their `expect`. Pass
   `--refresh` to resample.
 * Warehouse work is batched (`--batch-size` relations per query), cached in
-  `target/lc-kit/cache.json`, and resumable.
+  `target/lc-kit/cache.json`, and resumable. When switching dbt targets, use
+  a separate `--work-dir` and `--tests-dir` under the project model paths,
+  or remove the previous scratch fixtures and run `scaffold --refresh`.
+
+Run `harvest` once after upgrading the kit, and again when you edit or
+regenerate a fixture. `verify` requires the fixture to match the file
+recorded by `harvest`, including for an empty warehouse expectation. Use the
+same project checkout, dbt executable, target, and `--dbt-args` for both steps.
 
 Outputs:
 
 | Path | What |
 |---|---|
 | `models/_lc_kit_paired/*.yml` | the generated tests (tag `lc_kit_paired`). Delete the folder to undo |
-| `target/lc-kit/paired-report.md` | per-model classification plus the diff for every mismatch |
+| `target/lc-kit/paired-report.md` | latest per-model classification and any retained diff |
 | `target/lc-kit/*-report.json` | scaffold / harvest / verify details, including every set-aside reason |
+| `target/lc-kit/runs/verify-*/` | per-attempt reports and, when available, the dbt log and raw `run_results.json`. The JSON report records the fixture hashes and the result artifact's hash and invocation ID |
 | `target/lc-kit/set-aside/` | tests moved out of the project because they have no trustworthy `expect` |
-| `target/lc-kit/logs/` | each dbt invocation. Sampled rows are never logged |
+| `target/lc-kit/logs/` | scaffold and harvest dbt logs |
 
-**Privacy.** The generated YAML contains (anonymized) sample rows from your
-warehouse. Do not commit it, and review any snippet you copy into a ledger
-entry. A minimal repro should use literal values you made up
-([bug-ledger.md](bug-ledger.md)).
+**Privacy.** The generated YAML, cache, dbt logs, artifacts, and reports can
+contain warehouse data and project identifiers. Keep them private, and use
+invented values and identifiers in a shared repro. See [the bug ledger guide](bug-ledger.md).
 
 ## When the warehouse copy fails (`broken`)
 
@@ -164,16 +172,12 @@ a match and never a finding, but it is worth knowing the usual causes:
 ## Empty expects are common
 
 Inputs are sampled independently, so joins between them, and filters on
-rare values, often leave nothing: in the campaign about a third of the
-cases that passed on the warehouse had an empty `expect`. Hashing a column
-the model filters on empties it too, which is why the generator now keeps
-literal values and spares non-personal `*_name` columns. A larger
-`--sample-rows` helps a little. What helped most internally was sampling
-inputs **together**: take a few rows of the model's own output, then sample
-each input by the identifier columns it shares with them. That rescued about
-one in five empty cases, but even then roughly 30% stayed empty. The kit
-does not do this yet; `match_empty` is reported separately so an empty case
-is never mistaken for proof.
+rare values often leave no output rows. Hashing a column the model filters
+on can also empty the result, so the generator keeps SQL literal values and
+spares non-personal `*_name` columns. Try a larger `--sample-rows` when
+independent input samples leave few join matches. `match_empty` records
+agreement that zero rows were returned. A useful value check exercises
+inputs that produce rows, such as fixtures with matching join keys.
 
 **Views and slow inputs.** Sampling a view runs the view, and `limit` does
 not stop a view that ranks or aggregates all of history. When a batch times

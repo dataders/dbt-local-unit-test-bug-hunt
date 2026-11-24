@@ -51,6 +51,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -63,6 +64,8 @@ TAG = "lc_kit_paired"
 # by name, so a new contract must get a new name.
 FORMAT_VERSION = 3
 OPT_IN_ENV = "DBT_ENGINE_EXPERIMENTAL_LOCAL_UNIT_TESTS"
+FAILED = {"error", "fail", "failed", "runtime error"}
+BARE_STATUS = FAILED | {"", "none", "null", "skipped"}
 
 # Introspection macros that would otherwise consult the warehouse at compile
 # time. Overriding them keeps the test source-free and identical on both
@@ -266,7 +269,10 @@ class Run:
     stderr: str
 
 
-def run_dbt(args: argparse.Namespace, argv: list[str], label: str, *, log_output: bool = True) -> Run:
+def run_dbt(
+    args: argparse.Namespace, argv: list[str], label: str, *,
+    log_output: bool = True, log_dir: Path | None = None,
+) -> Run:
     command = [args.dbt, *argv]
     if args.dbt_args:
         command += shlex.split(args.dbt_args)
@@ -278,8 +284,11 @@ def run_dbt(args: argparse.Namespace, argv: list[str], label: str, *, log_output
         proc = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout, env=env)
         result = Run(command, proc.returncode, time.monotonic() - started, proc.stdout, proc.stderr)
     except subprocess.TimeoutExpired as exc:
-        result = Run(command, 124, time.monotonic() - started, str(exc.stdout or ""), str(exc.stderr or ""))
-    log = args.work_dir / "logs" / f"{label}.log"
+        result = Run(command, 124, time.monotonic() - started, *(
+            data.decode(errors="replace") if isinstance(data, bytes) else data or ""
+            for data in (exc.stdout, exc.stderr)
+        ))
+    log = (log_dir if log_dir is not None else args.work_dir / "logs") / f"{label}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     header = f"$ {shlex.join(command)}\nexit={result.code} seconds={result.seconds:.1f}\n"
     # `dbt show` output carries sampled warehouse rows: keep it out of logs.
@@ -465,7 +474,7 @@ def cache_path(args: argparse.Namespace) -> Path:
 def load_cache(args: argparse.Namespace) -> dict:
     path = cache_path(args)
     base = {"schemas": {}, "samples": {}, "schema_errors": {}, "sample_errors": {}, "sample_rows": args.sample_rows}
-    if path.is_file():
+    if path.is_file() and not args.refresh:
         cached = json.loads(path.read_text())
         if cached.get("sample_rows") == args.sample_rows:
             base.update(cached)
@@ -797,6 +806,8 @@ def expect_columns_to_drop(case: Case, rows: list[dict[str, Any]], requested: li
 def command_harvest(args: argparse.Namespace) -> int:
     cases = [c for c in selected_cases(args) if not c.set_aside and (args.tests_dir / c.filename).is_file()]
     print(f"harvest: {len(cases)} generated test(s)")
+    if not cases:
+        return 1
     target = compile_tests(args, cases)
     compiled = {p.stem: p for p in (target / "compiled").rglob("lc_kit__*.sql")}
     loads = json.JSONDecoder(parse_float=decimal.Decimal).decode
@@ -857,6 +868,12 @@ def command_harvest(args: argparse.Namespace) -> int:
             del results[u]
         elif drop:
             dropped_columns[u] = drop
+    prior = read_harvest_report(args)
+    fixture_hashes = prior.get("fixture_sha256", {})
+    prior_set_aside = prior.get("set_aside", {})
+    for case in cases:
+        fixture_hashes.pop(case.unique_id, None)
+        prior_set_aside.pop(case.unique_id, None)
     for u, rows in results.items():
         path = args.tests_dir / by_id[u].filename
         payload = read_yaml(path)
@@ -865,6 +882,7 @@ def command_harvest(args: argparse.Namespace) -> int:
         for test in payload["unit_tests"]:
             test["expect"] = expect
         write_yaml(path, payload)
+        fixture_hashes[u] = hashlib.sha256(path.read_bytes()).hexdigest()
     for u in set_aside:
         # A test with no trustworthy oracle must not run as if it had one.
         path = args.tests_dir / by_id[u].filename
@@ -876,43 +894,96 @@ def command_harvest(args: argparse.Namespace) -> int:
         "harvested": len(results),
         "empty_expect": sorted(u for u, r in results.items() if not r),
         "expect_columns_dropped": dropped_columns,
-        "set_aside": set_aside,
+        "fixture_sha256": fixture_hashes,
+        "set_aside": {**prior_set_aside, **set_aside},
     })
     print(f"harvested {len(results)} expectation(s) ({sum(1 for r in results.values() if not r)} empty, "
           f"{len(dropped_columns)} with dropped columns); set aside {len(set_aside)}; report: {report}")
     return 0
 
 
-def run_paired(args: argparse.Namespace, cases: list[Case]) -> dict[str, dict]:
-    """One `dbt test` over both copies of every case; results keyed by test name."""
-    target = args.work_dir / "verify-target"
-    shutil.rmtree(target, ignore_errors=True)
-    names = [c.side(compute) for c in cases for compute in ("remote", "local")]
-    argv = ["test", "--resource-type", "unit_test", "--select", *names, "--target-path", str(target)]
-    result = run_dbt(args, argv, "verify")
-    results_path = target / "run_results.json"
-    if not results_path.is_file():
-        print(f"  no run_results.json (exit {result.code}); see logs/verify.log")
-        return {}
+def read_harvest_report(args: argparse.Namespace) -> dict:
+    path = args.work_dir / "harvest-report.json"
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def fixture_expectation(case: Case, data: bytes) -> list:
+    """Verify that compute and test name are the only differences between copies."""
+    try:
+        remote, local = yaml.safe_load(data)["unit_tests"]
+        for test, side in ((remote, "remote"), (local, "local")):
+            if test.pop("name") != case.side(side) or test["config"].pop("compute") != side:
+                raise ValueError("unexpected test name or compute setting")
+        if remote != local or remote["model"] != case.name:
+            raise ValueError("warehouse and local tests must use the same model, inputs and expectation")
+        rows = remote["expect"]["rows"]
+        if not isinstance(rows, list):
+            raise ValueError("expect.rows must be a list")
+        return rows
+    except (AttributeError, KeyError, TypeError, ValueError, yaml.YAMLError) as error:
+        raise ValueError(f"invalid paired fixture: {error}") from error
+
+
+def run_paired(
+    args: argparse.Namespace, cases: list[Case], run_dir: Path,
+) -> tuple[dict[str, dict], dict]:
+    """Run just the selected pairs and retain a fresh artifact and log."""
+    names = {c.side(side): c for c in cases for side in ("remote", "local")}
+    with tempfile.TemporaryDirectory(prefix="dbt-", dir=run_dir) as scratch:
+        target = Path(scratch) / "target"
+        argv = ["test", "--resource-type", "unit_test", "--select", *names,
+                "--target-path", str(target)]
+        result = run_dbt(args, argv, "verify", log_dir=run_dir)
+        results_path = target / "run_results.json"
+        artifact = results_path.read_bytes() if results_path.is_file() else None
+
+    evidence = {"exit_code": result.code, "log": "verify.log"}
+    if artifact is None:
+        return {}, {**evidence, "error": "dbt did not write run_results.json"}
+    (run_dir / "run_results.json").write_bytes(artifact)
+    evidence["run_results_sha256"] = hashlib.sha256(artifact).hexdigest()
+    try:
+        payload = json.loads(artifact)
+        items = payload["results"]
+        if not isinstance(items, list):
+            raise ValueError("results is not a list")
+        evidence["invocation_id"] = (payload.get("metadata") or {}).get("invocation_id")
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        return {}, {**evidence, "error": f"invalid dbt result artifact: {error}"}
+
+    wanted = {}
+    for name, case in names.items():
+        model_id = ".".join(case.unique_id.split(".")[1:3])
+        uid = f"unit_test.{model_id}.{name}"
+        if case.version is not None:
+            uid += f".v{case.version}"
+        wanted[uid] = name
+
     diffs = failure_blocks(result.stdout)
-    errors = error_blocks(result.stdout + "\n" + result.stderr)
+    errors = {}
+    for block in error_blocks(result.stdout + "\n" + result.stderr):
+        tokens = set(re.findall(r"\w+", block))
+        mentioned = names.keys() & tokens
+        if len(mentioned) == 1:
+            errors.setdefault(mentioned.pop(), block)
     out = {}
-    for item in json.loads(results_path.read_text()).get("results", []):
-        name = item.get("unique_id", "").rsplit(".", 1)[-1]
-        entry = {"status": item.get("status"), "message": (item.get("message") or "")[:2000], "diff": None}
-        if entry["status"] != "pass":
-            # Fusion reports a failed diff as status `error` with message
-            # `Error`; the diff table (or the real error) is only in stdout.
-            entry["diff"] = diffs.get(name)
-            model = name.removeprefix("lc_kit__").rsplit("__f", 1)[0]
-            # Both copies of a case run together; never take the other copy's error.
-            other = name[: -len("__local")] + "__remote" if name.endswith("__local") else name[: -len("__remote")] + "__local"
-            match = next((e for e in errors if name in e), None) or next(
-                (e for e in errors if model in e and other not in e), None
-            )
-            entry["message"] = (match or entry["message"])[:2000]
-        out[name] = entry
-    return out
+    for item in items:
+        uid = item.get("unique_id") if isinstance(item, dict) else None
+        if not isinstance(uid, str) or uid not in wanted:
+            continue
+        name = wanted[uid]
+        if name in out:
+            return {}, {**evidence, "error": f"duplicate unit-test result for {name}"}
+        status = str(item.get("status") or "").strip().lower()
+        message = str(item.get("message") or "")
+        # Logs may add diagnostic detail. Only the artifact establishes the outcome.
+        diff = None
+        if status in FAILED:
+            diff = diffs.get(name) or diffs.get(uid) or diffs.get(uid.split(".", 3)[-1])
+        if status in FAILED and message.strip().lower() in BARE_STATUS:
+            message = errors.get(name, message)
+        out[name] = {"unique_id": uid, "status": status, "message": message[:2000], "diff": diff}
+    return out, evidence
 
 
 def failure_blocks(stdout: str) -> dict[str, str]:
@@ -951,53 +1022,108 @@ def error_blocks(text: str) -> list[str]:
 
 
 def classify(remote: dict | None, local: dict | None, empty_expect: bool) -> str:
-    if remote is None or local is None:
-        return "unknown"
-    if remote["status"] != "pass":
+    remote_status = remote["status"] if remote else None
+    local_status = local["status"] if local else None
+    if remote_status in FAILED:
         return "broken"
-    if local["status"] == "pass":
+    if remote_status != "pass" or local_status not in FAILED | {"pass"}:
+        return "unknown"
+    if local_status == "pass":
         return "match_empty" if empty_expect else "match"
-    return "mismatch" if local.get("diff") else "local_error"
+    return "mismatch" if local and local.get("diff") else "local_error"
 
 
 def command_verify(args: argparse.Namespace) -> int:
-    cases = [c for c in selected_cases(args) if (args.tests_dir / c.filename).is_file()]
-    print(f"verify: {len(cases)} generated test(s)")
-    if not cases:
-        return 1
-    results = run_paired(args, cases)
+    selected = selected_cases(args)
+    harvest = read_harvest_report(args)
+    set_aside = {}
+    cases = []
+    for case in selected:
+        reason = case.set_aside
+        if not (args.tests_dir / case.filename).is_file():
+            reason = reason or harvest.get("set_aside", {}).get(case.unique_id)
+        if reason:
+            set_aside[case.unique_id] = reason
+        else:
+            cases.append(case)
+    run_root = args.work_dir / "runs"
+    run_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="verify-", dir=run_root))
+    harvested = harvest.get("fixture_sha256", {})
+    ready, skips = {}, {}
+    for case in cases:
+        fixture = args.tests_dir / case.filename
+        if not fixture.is_file():
+            skips[case.unique_id] = "generated fixture is missing"
+            continue
+        data = fixture.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        try:
+            expect = fixture_expectation(case, data)
+        except ValueError as error:
+            skips[case.unique_id] = str(error)
+            continue
+        if digest != harvested.get(case.unique_id):
+            skips[case.unique_id] = "fixture has no matching warehouse harvest; run harvest first"
+            continue
+        ready[case.unique_id] = (digest, len(expect))
+
+    runnable = [c for c in cases if c.unique_id in ready]
+    print(f"verify: {len(runnable)}/{len(cases)} model fixture(s) ready")
+    results, evidence = run_paired(args, runnable, run_dir) if runnable else ({}, {})
     rows = []
     for case in cases:
-        expect = read_yaml(args.tests_dir / case.filename)["unit_tests"][0]["expect"]["rows"]
+        digest, expect_rows = ready.get(case.unique_id, (None, None))
+        reason = skips.get(case.unique_id) or evidence.get("error")
+        if digest is not None:
+            fixture = args.tests_dir / case.filename
+            if not fixture.is_file() or hashlib.sha256(fixture.read_bytes()).hexdigest() != digest:
+                reason = "fixture changed during verification"
         r, l = results.get(case.side("remote")), results.get(case.side("local"))
         rows.append({
-            "model": case.name, "test": case.test_name, "class": classify(r, l, not expect),
-            "remote": r, "local": l, "expect_rows": len(expect),
+            "model": case.name, "model_id": case.unique_id, "test": case.test_name,
+            "class": "unknown" if reason else classify(r, l, expect_rows == 0),
+            "remote": r, "local": l, "expect_rows": expect_rows, "fixture_sha256": digest,
+            "reason": reason,
         })
     counts = collections.Counter(r["class"] for r in rows)
-    warehouse_pass = sum(counts[k] for k in ("match", "match_empty", "mismatch", "local_error"))
-    matched = counts["match"] + counts["match_empty"]
-    harvest = args.work_dir / "harvest-report.json"
-    aside = len(json.loads(harvest.read_text()).get("set_aside", {})) if harvest.is_file() else 0
-    line = (f"paired {matched}/{warehouse_pass} pass on both sides "
-            f"({counts['mismatch']} value mismatch, {counts['local_error']} local error, "
-            f"{counts['broken']} broken, {counts['unknown']} unknown, {aside} set aside; "
-            f"{counts['match_empty']} of the matches have an empty expect)")
-    report = write_report(args, "paired-report.json", {"scoreboard": line, "counts": dict(counts), "cases": rows})
-    md = [f"# Paired unit tests\n\n`{line}`\n", "| model | class | expect rows | local message |", "|---|---|---|---|"]
+    warehouse_pass = sum(not row["reason"] and (row["remote"] or {}).get("status") == "pass" for row in rows)
+    undiagnosed = sum(
+        row["class"] == "local_error" and row["local"]["message"].strip().lower() in BARE_STATUS
+        for row in rows
+    )
+    line = (f"matches {counts['match']} nonempty / {counts['match_empty']} empty | "
+            f"mismatches {counts['mismatch']} | local errors {counts['local_error']} "
+            f"({undiagnosed} without a diagnostic) | broken {counts['broken']} | unknown {counts['unknown']} | "
+            f"warehouse passes {warehouse_pass}/{len(rows)} eligible | set aside {len(set_aside)}")
+    report = write_report(args, "paired-report.json", {
+        "scoreboard": line, "counts": dict(counts), "warehouse_pass": warehouse_pass,
+        "local_errors_without_diagnostic": undiagnosed, "run_dir": str(run_dir),
+        "execution": evidence, "cases": rows, "set_aside": set_aside,
+    })
+    shutil.copyfile(report, run_dir / report.name)
+    md = [f"# Paired unit tests\n\n{line}\n", "| model | class | expect rows | detail |", "|---|---|---|---|"]
     order = lambda r: (r["class"] not in {"mismatch", "local_error"}, r["model"])  # noqa: E731
     for r in sorted(rows, key=order):
-        msg = (r["local"] or {}).get("message", "").splitlines()[0:1]
-        md.append(f"| {r['model']} | {r['class']} | {r['expect_rows']} | {(msg[0] if msg else '')[:160].replace('|', '/')} |")
+        detail = r["reason"] or ((r["local"] or {}).get("message") or "")
+        if r["class"] == "unknown" and not r["reason"]:
+            remote = (r["remote"] or {}).get("status") or "missing"
+            local = (r["local"] or {}).get("status") or "missing"
+            detail = f"warehouse {remote}, local {local}"
+        msg = (detail.splitlines() or [""])[0][:160].replace("|", "/")
+        expect_rows = r["expect_rows"] if r["expect_rows"] is not None else "unknown"
+        md.append(f"| {r['model']} | {r['class']} | {expect_rows} | {msg} |")
     for r in sorted(rows, key=order):
         detail = (r["local"] or {}).get("diff") or (r["class"] == "local_error" and (r["local"] or {}).get("message"))
         if r["class"] in {"mismatch", "local_error"} and detail:
             md += [f"\n## {r['model']} ({r['class']})\n", "Diff cells read `warehouse -> local`.\n" if r["class"] == "mismatch" else "",
                    "```", detail, "```"]
-    (args.work_dir / "paired-report.md").write_text("\n".join(md) + "\n")
+    rendered = "\n".join(md) + "\n"
+    (run_dir / "paired-report.md").write_text(rendered)
+    (args.work_dir / "paired-report.md").write_text(rendered)
     print(line)
-    print(f"report: {report} (and paired-report.md)")
-    return 0
+    print(f"report: {report} (and paired-report.md); retained evidence: {run_dir}")
+    return 0 if any(row["class"] != "unknown" for row in rows) else 1
 
 
 def command_all(args: argparse.Namespace) -> int:
@@ -1025,12 +1151,19 @@ def parser() -> argparse.ArgumentParser:
                    help="do not set aside models whose SQL calls now()/random()/...")
     p.add_argument("--drop-expect-column", action="append", default=[], metavar="MODEL.COLUMN",
                    help="leave a column out of expect, e.g. a clock-derived 'fct_x.DAYS_SINCE'; repeatable")
-    p.add_argument("--refresh", action="store_true", help="rewrite existing generated tests (drops their expect)")
+    p.add_argument("--refresh", action="store_true", help="resample inputs and regenerate fixtures (drops their expect)")
     return p
 
 
 def main() -> int:
-    args = parser().parse_args()
+    options = parser()
+    args = options.parse_args()
+    try:
+        extra_args = shlex.split(args.dbt_args)
+    except ValueError as error:
+        options.error(str(error))
+    if any(arg == "--compute" or arg.startswith("--compute=") for arg in extra_args):
+        options.error("paired unit tests set compute in each generated test; remove --compute from --dbt-args")
     if not args.manifest.is_file():
         print(f"no manifest at {args.manifest}; run `dbt parse` (or `dbt compile`) first", file=sys.stderr)
         return 2

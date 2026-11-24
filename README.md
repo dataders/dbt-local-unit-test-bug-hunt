@@ -1,6 +1,6 @@
 # dbt local unit test bug hunt
 
-**Snowflake projects only.** Run **your own dbt project** under dbt Fusion's local compute
+**Snowflake projects only.** Run **your own dbt project** under dbt v2 local compute
 (`--compute local`, which executes on DuckDB on your machine). Find
 where it disagrees with your warehouse, and write the disagreements up as a
 short bug ledger for dbt Labs.
@@ -14,7 +14,7 @@ repos.
 
 * A dbt project on **Snowflake**. Other warehouses are not supported: the
   scripts generate Snowflake SQL and refuse other adapters.
-* A Fusion build of `dbt` with `--compute local` (`dbt --version`).
+* A dbt v2 (formerly Fusion) build with `--compute local` (`dbt --version`).
 * A Snowflake profile that can **read** your project's sources. Key-pair
   auth is best; browser SSO works for small projects.
 * [`uv`](https://docs.astral.sh/uv/) for the kit's scripts (they declare
@@ -70,7 +70,7 @@ dbt run --selector local_dag --compute local      # repeat until the pass count 
 cp target/run_results.json lc-local-1.json
 uv run $KIT/scripts/lc_compare.py --local lc-local-1.json --ledger BUG_LEDGER.md
 
-# 3. paired unit tests (documented local unit tests): same inputs, warehouse vs local, values compared
+# 3. paired unit tests on fixed inputs and a harvested warehouse expectation
 uv run $KIT/scripts/lc_fixtures.py all --select 'models/staging/*'
 cat target/lc-kit/paired-report.md
 
@@ -81,6 +81,13 @@ uv run $KIT/scripts/lc_ledger.py lint BUG_LEDGER.md
 Then add the new failures to `local_blockers` (or as cut points), widen
 the probe, and repeat. When you're done, send `BUG_LEDGER.md` to your dbt
 Labs contact.
+
+The model-run comparison can find local candidates with a single artifact.
+Supply `--remote` to compare against a warehouse `run_results.json` from the
+same selection. The paired report counts nonempty value matches, empty
+matches and unknown cases separately. Each `verify` attempt keeps its own
+report and available dbt evidence under `target/lc-kit/runs/`. Keep those
+directories and generated fixtures private.
 
 ## Read next
 
@@ -100,8 +107,8 @@ Labs contact.
 1. Never change your models, macros, configs, or packages to make local
    compute pass. A local failure is the finding.
 2. The warehouse is only read (`dbt pull`, `dbt show --compute remote`).
-3. Count a value match only when a paired test passes on **both** sides.
-   A test that fails on the warehouse is `broken`, never a match.
+3. Count a value match only when both sides pass the same **nonempty**
+   harvested warehouse expectation. Report empty output agreement separately.
 4. One entry per root cause, minimized, with made-up literals. No customer
    data in the ledger.
 5. Nothing is filed on dbt Labs' repositories. Optionally,

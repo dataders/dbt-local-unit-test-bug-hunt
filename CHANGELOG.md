@@ -1,5 +1,19 @@
 # Changelog
 
+## Run evidence and coverage
+
+* The model comparator reports the coverage of each artifact. A local-only
+  failure requires a warehouse pass for the same node. Local failures with
+  missing warehouse evidence are still available for triage.
+* Paired verification requires a recorded warehouse harvest. Run `harvest`
+  again for fixtures created with an earlier kit. The report distinguishes
+  nonempty matches, empty matches, unknown outcomes, and failures with no
+  usable diagnostic.
+* Each `verify` attempt keeps its reports and available dbt evidence in
+  `target/lc-kit/runs/`. Keep these files private.
+* `scaffold --refresh` fetches fresh samples and schemas before regenerating
+  fixtures.
+
 ## 2026-11-09: lessons from running at scale
 
 The kit was first checked on a 13-model sample project. Since then, the same

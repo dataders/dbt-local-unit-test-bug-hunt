@@ -9,7 +9,7 @@ Do not paste real customer data: minimal repros use made-up literals.
 - **Project:** <name> (<warehouse>), <n> models under the probe
 - **Fusion:** `dbt --version` → <version>
 - **Hunt dates:** <yyyy-mm-dd> to <yyyy-mm-dd>
-- **Headline:** `models <passing>/<total> pass locally | paired <match>/<warehouse-pass> (<broken> broken) | <n> entries`
+- **Headline:** `models <passed>/<pass-or-fail> pass locally (<reported> results) | paired <nonempty> nonempty matches, <empty> empty, <unknown> unknown | <n> entries`
 - **Contact:** <you>
 
 ## LC-001: <one-line summary: construct, what differs>

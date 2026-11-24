@@ -54,11 +54,10 @@ before a step you have not done before in this session.
    remote`, and the fixture generator only read. Do not `dbt run/build
    --compute remote` (that writes to the user's schemas) unless the user
    asks for a warehouse-side comparison run and names the target.
-4. **Matches are counted only when proven.** Paired scoreboard = cases
-   passing on both sides out of cases passing on the warehouse. A case that
-   fails on the warehouse is `broken`: report it separately, never as a
-   match. A scoped run claims only its slice. Something you did not compare
-   is unknown, not a match.
+4. **Matches are counted only when proven.** Count a value match when both
+   copies pass the same harvested nonempty expectation. Report empty
+   agreement, broken warehouse cases, and unknown outcomes. A scoped run
+   provides evidence for its selected cases and captured inputs.
 5. **Low volume, high quality.** One ledger entry per root cause. Group by
    signature, de-duplicate against the ledger before adding, and prefer one
    minimized repro over many symptoms. A triager reads every entry.
@@ -136,6 +135,8 @@ introspect other relations only compile once those are built. Say which
 pass the headline counts.
 For each **new** candidate family, confirm the warehouse side read-only:
 `dbt show --compute remote --select <example model> --limit 5`.
+When using `lc_compare.py --remote`, supply an artifact from the same
+revision and selection and check the reported coverage on both sides.
 
 ### 3. Paired unit tests (values; documented local unit tests)
 
@@ -149,11 +150,13 @@ drops the `compute: remote` copies from the schedule.
 
 Start with a slice (one folder) and widen. Read
 `target/lc-kit/paired-report.md`: each `mismatch` shows a diff whose cells
-read `warehouse -> local`. Rule out ties, float last digits (run local
+read `warehouse -> local`. Each verification keeps its evidence under
+`target/lc-kit/runs/`. Keep the raw reports, logs and fixtures private.
+Rule out ties, float last digits (run local
 twice), whole-hour time-zone shifts, and "now" effects before calling it a
-bug. Expect many `match_empty` cases (about a third on real projects): they
-prove little, so report them separately
-([docs/paired-unit-tests.md](docs/paired-unit-tests.md)).
+bug. Report `match_empty` as agreement on zero rows. Review `unknown` for
+missing results or a fixture that needs to be harvested again. See the
+[paired unit tests guide](docs/paired-unit-tests.md).
 
 ### 4. Classify
 
@@ -198,7 +201,7 @@ when the remaining failures are all recorded, or when the user says so.
 Lead every update with the headline numbers, then only what moved:
 
 ```text
-models 1,204/1,260 pass locally | paired 340/362 pass both (9 broken, 31 set aside) | ledger 6 entries (2 new) | blockers 4
+models 1,204/1,242 pass locally (1,260 results) | paired 315 nonempty matches, 25 empty, 5 unknown | ledger 6 entries (2 new) | blockers 4
 ```
 
 Then, briefly: what was found, what is **not** proven, and what runs next.

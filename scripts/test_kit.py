@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import decimal
+import hashlib
+import json
 import sys
 import textwrap
 from pathlib import Path
@@ -105,6 +107,110 @@ def test_classify_paired():
     assert fx.classify(ok, fail, False) == "mismatch"
     assert fx.classify(ok, {"status": "error", "diff": None}, False) == "local_error"
     assert fx.classify({"status": "error"}, ok, False) == "broken"
+    for status in (None, "skipped", "warn", "partial success", "anything else"):
+        assert fx.classify(ok, {"status": status}, False) == "unknown"
+        assert fx.classify({"status": status}, ok, False) == "unknown"
+    assert fx.classify(ok, None, False) == "unknown"
+
+
+def test_verify_requires_harvest_and_retains_fresh_evidence(tmp_path, monkeypatch):
+    args = fx.parser().parse_args([
+        "verify", "--work-dir", str(tmp_path / "work"), "--tests-dir", str(tmp_path / "tests"),
+    ])
+    cases = [
+        fx.Case(f"model.sample.{name}", name, None, "table", f"{name}.sql", [], [])
+        for name in ("matched", "empty", "skipped", "unharvested", "edited", "error")
+    ]
+    cases.append(fx.Case("model.sample.versioned.v2", "versioned", 2, "table", "versioned_v2.sql", [], []))
+    monkeypatch.setattr(fx, "selected_cases", lambda _: cases)
+    harvest = {}
+    for case in cases:
+        payload, _ = fx.test_payload(case, {}, {}, False)
+        if case.name in {"matched", "edited", "versioned"}:
+            for unit_test in payload["unit_tests"]:
+                unit_test["expect"] = {"rows": [{"id": 1}]}
+        path = args.tests_dir / case.filename
+        fx.write_yaml(path, payload)
+        if case.name != "unharvested":
+            harvest[case.unique_id] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if case.name == "edited":
+            with path.open("a") as file:
+                file.write("# edited after harvest\n")
+    fx.write_report(args, "harvest-report.json", {"fixture_sha256": harvest})
+
+    def fake_dbt(_, argv, label, *, log_dir):
+        names = argv[argv.index("--select") + 1:argv.index("--target-path")]
+        assert all("unharvested" not in name and "edited" not in name for name in names)
+        target = Path(argv[argv.index("--target-path") + 1])
+        target.mkdir()
+        results = [
+            {"unique_id": f"unit_test.sample.{case.name}.{case.side(side)}", "status": "pass"}
+            for case in cases if case.name in {"matched", "empty", "skipped", "error"}
+            for side in ("remote", "local")
+        ]
+        versioned = cases[-1]
+        results += [
+            {"unique_id": f"unit_test.sample.versioned.{versioned.side(side)}.v2", "status": "pass"}
+            for side in ("remote", "local")
+        ]
+        results.append({"unique_id": f"unit_test.sample.versioned.{versioned.side('local')}.v1", "status": "error"})
+        for result in results:
+            uid = result["unique_id"]
+            if ".skipped." in uid and uid.endswith("__local"):
+                result["status"] = "skipped"
+            if ".error." in uid and uid.endswith("__local"):
+                result.update(status="error", message="Error")
+        # Same name in a dependency package cannot supply the local result.
+        results.append({"unique_id": f"unit_test.dependency.skipped.{cases[2].side('local')}", "status": "pass"})
+        (target / "run_results.json").write_text(json.dumps({"metadata": {"invocation_id": "synthetic-1"}, "results": results}))
+        (log_dir / f"{label}.log").write_text("dbt test\n")
+        return fx.Run(argv, 1, 0.1, "[error] nearby model had a compilation error\n", "")
+
+    monkeypatch.setattr(fx, "run_dbt", fake_dbt)
+    assert fx.command_verify(args) == 0
+    report = json.loads((args.work_dir / "paired-report.json").read_text())
+    assert report["counts"] == {"match": 2, "match_empty": 1, "unknown": 3, "local_error": 1}
+    assert report["warehouse_pass"] == 5
+    assert report["local_errors_without_diagnostic"] == 1
+    first = Path(report["run_dir"])
+    artifact = (first / "run_results.json").read_bytes()
+    assert report["execution"]["run_results_sha256"] == hashlib.sha256(artifact).hexdigest()
+    assert report["execution"]["invocation_id"] == "synthetic-1"
+    assert (first / "verify.log").exists()
+
+    def no_artifact(_, argv, label, *, log_dir):
+        return fx.Run(argv, 124, 0.1, "", "")
+
+    monkeypatch.setattr(fx, "run_dbt", no_artifact)
+    assert fx.command_verify(args) == 1
+    report = json.loads((args.work_dir / "paired-report.json").read_text())
+    assert report["counts"] == {"unknown": 7}
+    assert report["execution"]["error"] == "dbt did not write run_results.json"
+    assert Path(report["run_dir"]) != first
+    assert (first / "run_results.json").read_bytes() == artifact
+
+
+def test_harvest_records_empty_oracle_and_does_not_compile_empty_selection(tmp_path, monkeypatch):
+    args = fx.parser().parse_args([
+        "harvest", "--work-dir", str(tmp_path / "work"), "--tests-dir", str(tmp_path / "tests"),
+    ])
+    case = fx.Case("model.sample.empty", "empty", None, "table", "empty.sql", [], [])
+    monkeypatch.setattr(fx, "selected_cases", lambda _: [case])
+    assert fx.command_harvest(args) == 1
+
+    path = args.tests_dir / case.filename
+    payload, _ = fx.test_payload(case, {}, {}, False)
+    fx.write_yaml(path, payload)
+    target = tmp_path / "compile"
+    compiled = target / "compiled" / f"{case.side('remote')}.sql"
+    compiled.parent.mkdir(parents=True)
+    compiled.write_text(COMPILED)
+    monkeypatch.setattr(fx, "compile_tests", lambda *_: target)
+    monkeypatch.setattr(fx, "show", lambda *_, **__: [])
+    assert fx.command_harvest(args) == 0
+    report = fx.read_harvest_report(args)
+    assert report["empty_expect"] == [case.unique_id]
+    assert report["fixture_sha256"][case.unique_id] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_failure_blocks_parse_fusion_output():

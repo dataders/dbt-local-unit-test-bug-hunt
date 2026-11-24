@@ -6,8 +6,8 @@ only the first two become ledger entries.
 
 ## The comparison
 
-Copy `target/run_results.json` aside after every run, because the next dbt
-command overwrites it. Then:
+Copy `target/run_results.json` aside after every run. The next dbt command
+can overwrite it.
 
 ```bash
 cp target/run_results.json lc-local.json
@@ -16,25 +16,38 @@ uv run $KIT/scripts/lc_compare.py --local lc-local.json --ledger BUG_LEDGER.md
 uv run $KIT/scripts/lc_compare.py --local lc-local.json --remote lc-remote.json --ledger BUG_LEDGER.md
 ```
 
-The first line is the run's headline:
+The report opens with counts from the retained artifacts.
 
 ```text
-models 1,204/1,260 pass locally | candidate families 7 (3 new) | local-only data-test failures 41 | both-fail 2 | skipped downstream 18
+models 1204/1242 pass locally | 1260 model results | candidate families 7 (3 new) | both-fail 2
 ```
 
-* **models passing locally** is the number to move. It only means "built",
-  not "same values". Values are what paired tests check.
-* **candidate families** groups local-only failures by a normalized error
-  signature (names, numbers, and quoted values stripped). One family is
-  usually one root cause, so 50 models failing with
-  `Scalar Function with name X does not exist` are one entry, not 50.
-  `(3 new)` counts families whose signature is not already in your ledger.
-* **local-only data-test failures** are listed separately and are *not*
-  candidates yet (see sampling, below).
-* **skipped downstream** models did not run because a parent failed. They
-  are not failures of their own.
-* Count models from the per-node results (what `lc_compare.py` does), not
-  from dbt's `Summary:` line: its total also counts hooks and no-op nodes.
+* **Models passing locally** counts successes among `model.*` results with
+  a pass or failure status. The report also gives the total number of local
+  model results and counts skips and other statuses. Compare that total
+  with your selected count to spot model results missing from the artifact.
+  Use paired unit tests for value checks.
+* **Warehouse coverage** uses node IDs from both artifacts. It reports
+  model results found only on either side and counts models with a pass or
+  failure recorded on both. Use artifacts with the same selection and
+  project revision, and record how inputs were prepared. The script reads
+  outcomes from the artifacts and cannot establish those conditions by
+  itself.
+* **Candidate families** groups local failures by normalized error message.
+  Each row counts failures on nodes that passed on the warehouse and those
+  with unverified warehouse outcomes. A missing, skipped, warning, or
+  unknown warehouse result provides no warehouse pass. Without `--remote`,
+  confirm each candidate with a read-only warehouse reproduction. `(3 new)`
+  counts signatures absent from the ledger. Inspect an example before
+  deciding whether a family represents a single cause.
+* **Failures without a diagnostic** include blank messages and bare statuses
+  such as `Error`. Check their logs before grouping them. **Data test
+  failures** are listed separately because they are sensitive to sampling.
+
+Pass `--json comparison.json` for the coverage counts, candidate families,
+and each node's outcome on both sides. Both reports can contain project
+identifiers and diagnostic messages. Keep them local and use synthetic data
+in anything you share.
 
 ### Multi-pass runs are normal
 
@@ -149,21 +162,22 @@ minimal repro gives you.
 `lc_fixtures.py verify` prints its own headline:
 
 ```text
-paired 12/13 pass on both sides (1 value mismatch, 0 local error, 1 broken, 0 unknown, 1 set aside; 0 of the matches have an empty expect)
+matches 11 nonempty / 1 empty | mismatches 1 | local errors 0 (0 without a diagnostic) | broken 1 | unknown 1 | warehouse passes 14/15 eligible | set aside 1
 ```
 
-* The denominator is **cases that pass on the warehouse**. A case that
-  fails on the warehouse is `broken` (a fixture problem). It is counted
-  separately and is never a match.
+* `match` means both copies passed a nonempty warehouse expectation.
+  `match_empty` means both copies returned zero rows. The warehouse pass
+  count includes cases with an unknown local outcome.
 * `value mismatch`: the model ran on both sides over identical inputs and
   returned different rows. The report shows the diff, with each cell reading
   `warehouse -> local`.
-* `local error`: the model errored locally over inputs on which the warehouse
-  succeeded.
-* `set aside`: no trustworthy oracle (nondeterministic, too large, not
-  unit-testable). Not counted either way.
-* `empty expect`: the warehouse returned no rows for this input, so the test
-  proves little. Report it, don't celebrate it.
+* `local error` means the local test failed over inputs for which the warehouse
+  passed. Check the retained log or rerun when the cause is unknown.
+* `broken` means the warehouse test failed. Investigate the fixture or warehouse setup.
+* `unknown` covers skipped, missing, or unsupported results and fixtures whose
+  harvest evidence is missing or stale.
+* `set aside` covers models that could not get a usable fixture or expectation,
+  such as nondeterministic queries or models with outputs above the row limit.
 
 Value mismatches worth a second look before you record them:
 
